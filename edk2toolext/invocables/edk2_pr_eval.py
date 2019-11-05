@@ -23,10 +23,22 @@ class PrEvalSettingsManager(MultiPkgAwareSettingsInterface):
     ''' Platform settings will be accessed through this implementation. '''
 
     def FilterPackagesToTest(self, changedFilesList: list, potentialPackagesList: list) -> list:
-        ''' Filter potential packages to test based on changed files. '''
+        ''' Filter potential packages to test based on changed files.
+            Param:
+              ChangedFilesList: list of edk2 relative paths to files that changed
+              potentialPackagesList: list of edk2 packages to determine if should build
+            return:
+              list of edk2 packages that should be built from the potential list
+        '''
 
-        # default implementation does zero filtering.
+        # default implementation does zero filtering.  Build them all.
         return potentialPackagesList
+    
+    def GetPackagesPath(self):
+        ''' Return a list of workspace relative paths that should be mapped as edk2 PackagesPath '''
+
+        # default implementation returns none
+        return []
 
 
 class Edk2PrEval(Edk2MultiPkgAwareInvocable):
@@ -70,9 +82,19 @@ class Edk2PrEval(Edk2MultiPkgAwareInvocable):
 
     def Go(self):
         workspace_path = self.GetWorkspaceRoot()
-        self.edk2_path_obj = path_utilities.Edk2Path(workspace_path, [])
+        self.edk2_path_obj = path_utilities.Edk2Path(workspace_path, self.PlatformSettings.GetPackagesPath())
         self.logger = logging.getLogger("edk2_pr_eval")
-        actualPackagesDict = self.get_packages_to_build(self.requested_package_list)
+
+        actualPackagesDict = {}
+        package_resolver = DiffToPackageResolver(self.edk2_path_obj)
+        (rc, files) = package_resolver.get_files_that_changed_in_this_pr(self.pr_target, os.path.abspath(os.getcwd()))
+        if(rc == 0):
+            actualPackagesDict = package_resolver.get_packages_to_build(
+                files, self.requested_package_list, self.PlatformSettings.FilterPackagesToTest)
+        else:
+            self.logger.error("Failed to get changed files.  Build all packages.  RC = %d", rc)
+            for a in self.requested_package_list:
+                actualPackagesDict[a] = f"Policy 0 - Failed to diff ({rc})"
 
         #
         # Report the packages that need to be built
@@ -100,26 +122,70 @@ class Edk2PrEval(Edk2MultiPkgAwareInvocable):
 
         return 0
 
-    def get_packages_to_build(self, possible_packages: list) -> dict:
+
+class DiffToPackageResolver():
+    ''' Evaluate a diff to resolve which packages need to be tested because they are impacted by the chaange'''
+
+    def __init__(self, PathObj: path_utilities.Edk2Path):
+        self.logger = logging.getLogger("DiffToPackageResolver")
         self.parsed_dec_cache = {}
-        (rc, files) = self._get_files_that_changed_in_this_pr(self.pr_target)
-        if rc != 0:
-            return {}
+        self.edk2_path_obj = PathObj
+
+    def get_files_that_changed_in_this_pr(self, base_branch, working_dir) -> tuple:
+        ''' Get all the files that changed in this pr.
+            working_dir should be absolute path to git repo that is checked out
+            with PR changes.
+
+            Return the error code and list of files. 
+            files are absolute path
+        '''
+
+        # get file differences between pr and base
+        output = StringIO()
+        cmd_params = f"diff --name-only HEAD..{base_branch}"
+        rc = RunCmd("git", cmd_params, workingdir=working_dir, outstream=output)
+
+        if(rc == 0):
+            self.logger.debug("git diff command returned successfully!")
+        else:
+            self.logger.critical("git diff returned error return value: %s" % str(rc))
+            return(rc, [])
+
+        if(output.getvalue() is None):
+            self.logger.info("No files listed in diff")
+            return(0, [])
+
+        files = output.getvalue().split()
+
+        # convert to abs path because git repo root is not relevant in 
+        # edk2 environment.  This should allow submodule
+        files = [os.path.join(working_dir, f) for f in files]
+        for f in files:
+            self.logger.debug(f"File Changed: {f}")
+        return(0, files)
+
+    def get_packages_to_build(self, files: list, possible_packages: list, plat_func) -> dict:
+        '''
+
+        param:
+          files: list of absolute file paths of files that changed
+        '''
 
         remaining_packages = possible_packages.copy()  # start with all possible packages and remove each
         # package once it is determined to be build.  This optimization
         # avoids checking packages that already will be built.
 
         packages_to_build = {}  # packages to build.  Key = pkg name, Value = 1st reason for build
+        edk2_relative_files = [self.edk2_path_obj.GetEdk2RelativePathFromAbsolutePath(f) for f in files]
 
         #
-        # Policy 1 - CI Settings file defined
+        # Policy 1 - platform function
         #
-        after = self.PlatformSettings.FilterPackagesToTest(files, remaining_packages)
+        after = plat_func(edk2_relative_files, remaining_packages.copy())
         for a in after:
             if a not in remaining_packages:
-                raise ValueError(f"PlatformSettings.FilterPackagesToTest returned package not allowed {a}")
-            packages_to_build[a] = "Policy 1 - PlatformSettings - Filter Packages"
+                raise ValueError(f"Platform Function FilterPackagesToTest returned package not allowed {a}")
+            packages_to_build[a] = "Policy 1 - Platform Function - Filter Packages"
             remaining_packages.remove(a)
 
         #
@@ -149,7 +215,7 @@ class Edk2PrEval(Edk2MultiPkgAwareInvocable):
         # Get all public files in packages
         for f in files:
             try:
-                pkg = self.edk2_path_obj.GetContainingPackage(os.path.abspath(f))
+                pkg = self.edk2_path_obj.GetContainingPackage(f)
 
             except Exception as e:
                 self.logger.error(f"Failed to get package for file {f}.  Exception {e}")
@@ -194,31 +260,6 @@ class Edk2PrEval(Edk2MultiPkgAwareInvocable):
         # if never found return False
         return False
 
-    def _get_files_that_changed_in_this_pr(self, base_branch) -> tuple:
-        ''' Get all the files that changed in this pr.
-            Return the error code and list of files
-        '''
-
-        # get file differences between pr and base
-        output = StringIO()
-        cmd_params = f"diff --name-only HEAD..{base_branch}"
-        rc = RunCmd("git", cmd_params, outstream=output)
-
-        if(rc == 0):
-            self.logger.debug("git diff command returned successfully!")
-        else:
-            self.logger.critical("git diff returned error return value: %s" % str(rc))
-            return(rc, [])
-
-        if(output.getvalue() is None):
-            self.logger.info("No files listed in diff")
-            return(0, [])
-
-        files = output.getvalue().split()
-        for f in files:
-            self.logger.debug(f"File Changed: {f}")
-        return(0, files)
-
     def _parse_dec_for_package(self, path_to_package):
         ''' find DEC for package and parse it'''
         # find DEC file
@@ -249,12 +290,12 @@ class Edk2PrEval(Edk2MultiPkgAwareInvocable):
         return dec
 
     def _is_public_file(self, filepath):
-        ''' return if file is a public files '''
-        fp = filepath.replace("\\", "/")  # make consistant for easy compare
-
-        self.logger.debug("Is public: " + fp)
+        ''' return if file is a public files.
+            filepath is absolute path
+        '''
+        self.logger.critical("Is public: " + filepath)
         try:
-            pkg = self.edk2_path_obj.GetContainingPackage(os.path.abspath(filepath))
+            pkg = self.edk2_path_obj.GetContainingPackage(filepath)
         except Exception as e:
             self.logger.error(f"Failed to GetContainingPackage({filepath}).  Exception: {str(e)}")
             return False
@@ -268,11 +309,22 @@ class Edk2PrEval(Edk2MultiPkgAwareInvocable):
             self.parsed_dec_cache[pkg] = dec
 
         if dec is None:
+            self.logger.info(f"No package DEC file for {filepath}.")
             return False
 
+        fp = filepath.replace("\\", "/")  # convert to edk2 sep
+        #
+        # Check to see if filepath has the include path as part of itself
+        #
         for includepath in dec.IncludePaths:
-            if (pkg + "/" + includepath) in filepath:
+            if (pkg + "/" + includepath + "/") in fp:
                 return True
+
+        #
+        # Check to see if filepath is the DEC file.
+        #
+        if filepath.lower().endswith(".dec"):
+            return True
 
         return False
 
